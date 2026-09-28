@@ -34,6 +34,19 @@ var forwardedHeaders = []string{
 	"X-Real-Ip",
 }
 
+// заголовки upstream (Cloudflare/exhentai), которые описывают их хост, а не прокси:
+// Alt-Svc отправляет браузер на HTTP/3 к прокси, HSTS с preload закрепляет домен за https
+var upstreamOnlyHeaders = []string{
+	"Alt-Svc",
+	"Cf-Cache-Status",
+	"Cf-Ray",
+	"Nel",
+	"Report-To",
+	"Server",
+	"Strict-Transport-Security",
+	"Via",
+}
+
 // типы ответов, в которых переписываются ссылки на exhentai
 var rewriteTypes = []string{
 	"application/javascript",
@@ -90,7 +103,14 @@ func shouldRewrite(contentType string) bool {
 	return false
 }
 
+// thumbPrefix — путь, через который проксируется хост обложек s.exhentai.org,
+// чтобы не заводить под него отдельный поддомен с DNS и сертификатом
+const thumbPrefix = "/__s"
+
 func rewrite(s string) string {
+	// s.exhentai.org заменяется раньше exhentai.org, иначе превратится в несуществующий s.<rootHost>
+	s = strings.ReplaceAll(s, "https://s.exhentai.org", conf.rootPath+thumbPrefix)
+	s = strings.ReplaceAll(s, "//s.exhentai.org", conf.rootPath+thumbPrefix)
 	s = strings.ReplaceAll(s, "https://exhentai.org", conf.rootPath)
 	// без PANDA_ROOT_HOST голый хост не трогаем, иначе он просто вырезается из текста
 	if conf.rootHost != "" {
@@ -104,8 +124,11 @@ func handle(c echo.Context) error {
 	req := c.Request()
 
 	// parse request
-	proxyReq, err := http.NewRequestWithContext(req.Context(), req.Method,
-		"https://exhentai.org"+req.URL.RequestURI(), req.Body)
+	upstream, uri := "https://exhentai.org", req.URL.RequestURI()
+	if strings.HasPrefix(uri, thumbPrefix+"/") {
+		upstream, uri = "https://s.exhentai.org", strings.TrimPrefix(uri, thumbPrefix)
+	}
+	proxyReq, err := http.NewRequestWithContext(req.Context(), req.Method, upstream+uri, req.Body)
 	if err != nil {
 		return c.String(http.StatusBadRequest, "bad request")
 	}
@@ -142,6 +165,9 @@ func handle(c echo.Context) error {
 
 	// copy headers, keeping repeated values
 	removeHopHeaders(resp.Header)
+	for _, k := range upstreamOnlyHeaders {
+		resp.Header.Del(k)
+	}
 	h := c.Response().Header()
 	for k, vs := range resp.Header {
 		switch k {
