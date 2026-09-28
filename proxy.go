@@ -1,37 +1,102 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"github.com/labstack/echo/v4"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 )
 
-var (
-	client *http.Client
+// maxRewriteBody ограничивает размер ответа, который читается в память для замены ссылок
+const maxRewriteBody = 32 << 20
 
-)
+// hop-by-hop заголовки не должны проходить через прокси (RFC 9110, 7.6.1)
+var hopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
 
-func init() {
+// заголовки, раскрывающие exhentai IP конечного пользователя
+var forwardedHeaders = []string{
+	"Forwarded",
+	"X-Forwarded-For",
+	"X-Forwarded-Host",
+	"X-Forwarded-Proto",
+	"X-Real-Ip",
+}
+
+// типы ответов, в которых переписываются ссылки на exhentai
+var rewriteTypes = []string{
+	"application/javascript",
+	"application/x-javascript",
+	"application/json",
+	"application/xml",
+	"application/xhtml+xml",
+}
+
+var client *http.Client
+
+func initClient() {
 	dialer := &net.Dialer{
-		Timeout:   connTimeout,
-		KeepAlive: connKeepAlive,
+		Timeout:   conf.connTimeout,
+		KeepAlive: conf.connKeepAlive,
 	}
 	client = &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dialer.DialContext(ctx, network, addr)
-			},
-			MaxIdleConnsPerHost: connMaxIdle,
-			DisableCompression:  true,
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           dialer.DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: conf.respTimeout,
+			MaxIdleConnsPerHost:   conf.connMaxIdle,
+			DisableCompression:    true,
 		},
 	}
+}
+
+func removeHopHeaders(h http.Header) {
+	for _, f := range h.Values("Connection") {
+		for _, k := range strings.Split(f, ",") {
+			if k = strings.TrimSpace(k); k != "" {
+				h.Del(k)
+			}
+		}
+	}
+	for _, k := range hopHeaders {
+		h.Del(k)
+	}
+}
+
+func shouldRewrite(contentType string) bool {
+	if strings.HasPrefix(contentType, "text/") {
+		return true
+	}
+	for _, t := range rewriteTypes {
+		if contentType == t {
+			return true
+		}
+	}
+	return false
+}
+
+func rewrite(s string) string {
+	s = strings.ReplaceAll(s, "https://exhentai.org", conf.rootPath)
+	// без PANDA_ROOT_HOST голый хост не трогаем, иначе он просто вырезается из текста
+	if conf.rootHost != "" {
+		s = strings.ReplaceAll(s, "exhentai.org", conf.rootHost)
+	}
+	return s
 }
 
 func handle(c echo.Context) error {
@@ -39,14 +104,18 @@ func handle(c echo.Context) error {
 	req := c.Request()
 
 	// parse request
-	proxyReq, err := http.NewRequest(req.Method, "https://exhentai.org"+req.URL.RequestURI(), req.Body)
+	proxyReq, err := http.NewRequestWithContext(req.Context(), req.Method,
+		"https://exhentai.org"+req.URL.RequestURI(), req.Body)
 	if err != nil {
-		return c.String(400, "bad request")
+		return c.String(http.StatusBadRequest, "bad request")
 	}
 
 	// fix header
-	header := &req.Header
-	proxyReq.Header = header.Clone()
+	proxyReq.Header = req.Header.Clone()
+	removeHopHeaders(proxyReq.Header)
+	for _, k := range forwardedHeaders {
+		proxyReq.Header.Del(k)
+	}
 	proxyReq.Header.Del("Authorization")
 	proxyReq.Header.Del("Cookie")
 	proxyReq.Header.Del("Accept-Encoding")
@@ -65,39 +134,45 @@ func handle(c echo.Context) error {
 	proxyReq.ContentLength = req.ContentLength
 
 	// send request
-	resp, err := client.Do(proxyReq) // todo: connection pool
+	resp, err := client.Do(proxyReq)
 	if err != nil {
-		return c.String(500, "server error")
+		return c.String(http.StatusBadGateway, "upstream error")
 	}
+	defer resp.Body.Close()
 
-	// set header
-	r := c.Response()
-	for k, _ := range resp.Header {
-		r.Header().Set(k, resp.Header.Get(k))
+	// copy headers, keeping repeated values
+	removeHopHeaders(resp.Header)
+	h := c.Response().Header()
+	for k, vs := range resp.Header {
+		switch k {
+		case "Content-Length", "Set-Cookie", "Location":
+			continue
+		}
+		for _, v := range vs {
+			h.Add(k, v)
+		}
 	}
-
-	// fix header
-	r.Header().Del("Content-Length")
-	cookieString := resp.Header.Get("Set-Cookie")
-	if cookieString != "" {
-		cookieString = strings.ReplaceAll(cookieString, "; domain=.exhentai.org", "")
-		r.Header().Set("Set-Cookie", cookieString)
+	for _, sc := range resp.Header.Values("Set-Cookie") {
+		h.Add("Set-Cookie", strings.ReplaceAll(sc, "; domain=.exhentai.org", ""))
+	}
+	if loc := resp.Header.Get("Location"); loc != "" {
+		h.Set("Location", rewrite(loc))
 	}
 
 	// check content type
-	contentType := strings.Split(resp.Header.Get("Content-Type"), ";")[0]
-	if contentType[:4] != "text" {
+	contentType := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
+	if !shouldRewrite(strings.ToLower(contentType)) {
 		return c.Stream(resp.StatusCode, contentType, resp.Body)
 	}
 
 	// replace content
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRewriteBody+1))
 	if err != nil {
-		return c.String(500, "server error")
+		return c.String(http.StatusBadGateway, "upstream error")
 	}
-	_ = resp.Body.Close()
-	body = bytes.ReplaceAll(body, []byte("https://exhentai.org"), []byte(rootPath))
-	body = bytes.ReplaceAll(body, []byte("exhentai.org"), []byte(rootHost))
+	if len(body) > maxRewriteBody {
+		return c.String(http.StatusBadGateway, "upstream response too large")
+	}
 
-	return c.Stream(resp.StatusCode, contentType, bytes.NewReader(body))
+	return c.Stream(resp.StatusCode, contentType, strings.NewReader(rewrite(string(body))))
 }

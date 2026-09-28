@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"strconv"
@@ -21,9 +22,10 @@ func ApplyPandaContext(next echo.HandlerFunc) echo.HandlerFunc {
 
 var RetrieveCredentials = middleware.BasicAuth(func(username, password string, c echo.Context) (bool, error) {
 	pc := c.(*PandaContext)
-	if username == "public" {
-		pc.MemberID = publicMemberID
-		pc.PassHash = publicPassHash
+	if subtle.ConstantTimeCompare([]byte(username), []byte(conf.publicUser)) == 1 &&
+		subtle.ConstantTimeCompare([]byte(password), []byte(conf.publicPassword)) == 1 {
+		pc.MemberID = conf.publicMemberID
+		pc.PassHash = conf.publicPassHash
 	} else if _, err := strconv.Atoi(username); err == nil && len(password) == 32 {
 		pc.MemberID = username
 		pc.PassHash = password
